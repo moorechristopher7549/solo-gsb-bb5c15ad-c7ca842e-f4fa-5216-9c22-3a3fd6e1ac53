@@ -9,6 +9,8 @@ import {
   type LoudnessThresholds,
 } from './audio/loudness';
 import { PeaksSupersededError, PeaksWorkerClient } from './audio/PeaksWorkerClient';
+import { RepeatSearchClient, RepeatSupersededError } from './audio/RepeatSearchClient';
+import type { RepeatSearchResult } from './audio/repeatSearch';
 import {
   applyMuting,
   clampMuteRegion,
@@ -32,6 +34,7 @@ import { FadePanel } from './components/FadePanel';
 import { ImportDialog } from './components/ImportDialog';
 import { LoudnessPanel } from './components/LoudnessPanel';
 import { MutePanel } from './components/MutePanel';
+import { RepeatPanel } from './components/RepeatPanel';
 import { SilencePanel } from './components/SilencePanel';
 import { TransportBar } from './components/TransportBar';
 import { TranscriptPanel, type LoadedTranscript } from './components/TranscriptPanel';
@@ -80,6 +83,12 @@ export default function App() {
   const peaksClientRef = useRef<PeaksWorkerClient | null>(null);
   if (!peaksClientRef.current) peaksClientRef.current = new PeaksWorkerClient();
   const peaksClient = peaksClientRef.current;
+
+  // 重复录制定位同样在独立 Web Worker 中完成；一次搜索一个 Worker，
+  // 连续搜索时旧任务被 terminate，界面只展示最新样本的结果
+  const repeatClientRef = useRef<RepeatSearchClient | null>(null);
+  if (!repeatClientRef.current) repeatClientRef.current = new RepeatSearchClient();
+  const repeatClient = repeatClientRef.current;
 
   const [fileName, setFileName] = useState<string | null>(null);
   const [peaks, setPeaks] = useState<Peaks | null>(null);
@@ -158,6 +167,13 @@ export default function App() {
   const [auditioning, setAuditioning] = useState(false);
   /** 停止试听并切回原始缓冲（供载入新音频等场景复用） */
   const stopAuditionRef = useRef<(restoreOriginal?: boolean) => void>(() => {});
+
+  // ---- 重复录制定位：以选中章节的原始音频为样本，在整段录音中找重录位置 ----
+  const [repeatSearching, setRepeatSearching] = useState(false);
+  const [repeatResult, setRepeatResult] = useState<RepeatSearchResult | null>(null);
+  const [repeatError, setRepeatError] = useState<string | null>(null);
+  /** 单调递增的搜索代号；只允许最新一次搜索回写结果 */
+  const repeatTokenRef = useRef(0);
 
   /** 弹出一条临时提示；同一手势内相同 key 的提示不重复弹出。 */
   const showNotice = useCallback((msg: string, key: string, durationMs = 2200) => {
@@ -289,8 +305,9 @@ export default function App() {
     () => () => {
       engine.dispose();
       peaksClient.dispose();
+      repeatClient.dispose();
     },
-    [engine, peaksClient],
+    [engine, peaksClient, repeatClient],
   );
 
   /**
@@ -446,6 +463,22 @@ export default function App() {
     setTranscript(null);
     setTranscriptError(null);
   }, [fileName]);
+
+  // ---- 重复录制定位：更换音频或修改样本章节（选中章节、其边界、删除）时，
+  // 立即取消在跑的搜索并清空旧结果——旧结果对新样本没有意义 ----
+  useEffect(() => {
+    repeatTokenRef.current += 1;
+    repeatClient.cancel();
+    setRepeatSearching(false);
+    setRepeatResult(null);
+    setRepeatError(null);
+  }, [
+    repeatClient,
+    fileName,
+    selectedId,
+    selected?.start,
+    selected?.end,
+  ]);
 
   // ---- 逐字稿：读取本地 WebVTT 并按当前时长裁剪；不会产生任何章节 ----
   const onTranscriptFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -755,6 +788,44 @@ export default function App() {
       end: r.endFrame / buffer.sampleRate,
     }));
   }, [muteRegions, duration]);
+
+  // ---- 重复录制定位 ----
+  /**
+   * 以当前选中章节的原始音频为样本发起 Worker 搜索。连续点击 / 改样本后重搜：
+   * 客户端先 terminate 旧 Worker（旧 promise 以 RepeatSupersededError 拒绝），
+   * token 再兜一层，保证只有最新一次结果能写进面板。
+   */
+  const runRepeatSearch = useCallback(() => {
+    const buffer = currentBufferRef.current;
+    const chapter = chaptersApi.selected;
+    if (!buffer || !chapter) return;
+    const token = ++repeatTokenRef.current;
+    setRepeatError(null);
+    setRepeatResult(null);
+    setRepeatSearching(true);
+    repeatClient
+      .search(buffer, chapter.start, chapter.end)
+      .then((result) => {
+        if (token !== repeatTokenRef.current) return; // 已被更新的搜索 / 样本变更取代
+        setRepeatSearching(false);
+        setRepeatResult(result);
+      })
+      .catch((err: unknown) => {
+        if (err instanceof RepeatSupersededError) return;
+        if (token !== repeatTokenRef.current) return;
+        setRepeatSearching(false);
+        setRepeatResult(null);
+        setRepeatError(err instanceof Error ? err.message : '重复定位搜索失败。');
+      });
+  }, [repeatClient, chaptersApi]);
+
+  /** 手动取消搜索；结果一并清空。 */
+  const cancelRepeatSearch = useCallback(() => {
+    repeatTokenRef.current += 1;
+    repeatClient.cancel();
+    setRepeatSearching(false);
+    setRepeatResult(null);
+  }, [repeatClient]);
 
   const addAtPlayhead = useCallback(() => {
     chaptersApi.createAtPlayhead(playhead);
@@ -1073,6 +1144,15 @@ export default function App() {
                 onProcess={processMuting}
                 onToggleAudition={toggleAudition}
                 onDownload={downloadMutedWav}
+              />
+              <RepeatPanel
+                selected={selected}
+                searching={repeatSearching}
+                result={repeatResult}
+                error={repeatError}
+                onSearch={runRepeatSearch}
+                onCancel={cancelRepeatSearch}
+                onPreviewAt={previewFrom}
               />
               {selected ? (
                 <>

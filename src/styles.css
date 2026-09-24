@@ -1138,3 +1138,85 @@ b.imp-status-valid {
   color: var(--muted);
   font-size: 12px;
 }
+
+/* ---- 重复录制定位 ---- */
+.repeat-sample {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+}
+
+.repeat-sample-name {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.repeat-sample-time {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.repeat-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.repeat-summary {
+  line-height: 1.5;
+}
+
+.repeat-hit-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.repeat-hit {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  font-size: 12px;
+  text-align: left;
+}
+
+.repeat-hit-idx {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  width: 20px;
+  flex-shrink: 0;
+}
+
+.repeat-hit-time {
+  flex: 1;
+  min-width: 0;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.repeat-hit-score {
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.repeat-hit-score.rep-score-high {
+  color: #7ee787;
+}
+
+.repeat-hit-score.rep-score-mid {
+  color: #e3b341;
+}
+
+.repeat-hit-score.rep-score-low {
+  color: #ff9a92;
+}
