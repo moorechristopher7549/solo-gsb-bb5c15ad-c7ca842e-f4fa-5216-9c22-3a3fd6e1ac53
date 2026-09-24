@@ -10,6 +10,11 @@ import {
 } from './audio/loudness';
 import { PeaksSupersededError, PeaksWorkerClient } from './audio/PeaksWorkerClient';
 import {
+  RepeatSearchSupersededError,
+  RepeatSearchWorkerClient,
+} from './audio/RepeatSearchWorkerClient';
+import type { RepeatHit } from './audio/repeatSearch';
+import {
   applyMuting,
   clampMuteRegion,
   encodeMutedWav,
@@ -32,6 +37,7 @@ import { FadePanel } from './components/FadePanel';
 import { ImportDialog } from './components/ImportDialog';
 import { LoudnessPanel } from './components/LoudnessPanel';
 import { MutePanel } from './components/MutePanel';
+import { RepeatSearchPanel } from './components/RepeatSearchPanel';
 import { SilencePanel } from './components/SilencePanel';
 import { TransportBar } from './components/TransportBar';
 import { TranscriptPanel, type LoadedTranscript } from './components/TranscriptPanel';
@@ -80,6 +86,11 @@ export default function App() {
   const peaksClientRef = useRef<PeaksWorkerClient | null>(null);
   if (!peaksClientRef.current) peaksClientRef.current = new PeaksWorkerClient();
   const peaksClient = peaksClientRef.current;
+
+  // 重复录制搜索同样在独立 Web Worker 中进行；连续搜索只保留最新一次
+  const repeatClientRef = useRef<RepeatSearchWorkerClient | null>(null);
+  if (!repeatClientRef.current) repeatClientRef.current = new RepeatSearchWorkerClient();
+  const repeatClient = repeatClientRef.current;
 
   const [fileName, setFileName] = useState<string | null>(null);
   const [peaks, setPeaks] = useState<Peaks | null>(null);
@@ -159,6 +170,13 @@ export default function App() {
   /** 停止试听并切回原始缓冲（供载入新音频等场景复用） */
   const stopAuditionRef = useRef<(restoreOriginal?: boolean) => void>(() => {});
 
+  // ---- 重复录制定位：以选中章节为样本在整段录音中查找重复片段 ----
+  const [repeatHits, setRepeatHits] = useState<RepeatHit[] | null>(null);
+  const [repeatSearching, setRepeatSearching] = useState(false);
+  const [repeatError, setRepeatError] = useState<string | null>(null);
+  /** 单调递增 token：连续搜索 / 样本变化时，旧搜索的结果一律作废 */
+  const repeatTokenRef = useRef(0);
+
   /** 弹出一条临时提示；同一手势内相同 key 的提示不重复弹出。 */
   const showNotice = useCallback((msg: string, key: string, durationMs = 2200) => {
     if (noticeKeyRef.current === key) return;
@@ -216,6 +234,18 @@ export default function App() {
       return entries.length === Object.keys(prev).length ? prev : Object.fromEntries(entries);
     });
   }, [chapters]);
+
+  // 重复录制定位：样本是「当前选中章节」。换选章节、修改样本边界（或删除 /
+  // 换音频导致选中清空）都会改变此 key —— 旧命中与进行中的搜索一并作废。
+  // 重命名不改变 key，旧结果保留。
+  const repeatSampleKey = selected ? `${selected.id}|${selected.start}|${selected.end}` : null;
+  useEffect(() => {
+    repeatTokenRef.current += 1;
+    repeatClient.cancel();
+    setRepeatHits(null);
+    setRepeatError(null);
+    setRepeatSearching(false);
+  }, [repeatSampleKey, repeatClient]);
 
   // recompute candidates whenever params or chapters change
   const suggestions = useMemo(() => {
@@ -289,8 +319,9 @@ export default function App() {
     () => () => {
       engine.dispose();
       peaksClient.dispose();
+      repeatClient.dispose();
     },
-    [engine, peaksClient],
+    [engine, peaksClient, repeatClient],
   );
 
   /**
@@ -343,6 +374,12 @@ export default function App() {
         setMutedResult(null);
         setMuteStale(false);
         setAuditioning(false);
+        // 重复定位结果按旧缓冲计算：与进行中的搜索一并作废
+        repeatTokenRef.current += 1;
+        repeatClient.cancel();
+        setRepeatHits(null);
+        setRepeatError(null);
+        setRepeatSearching(false);
         currentBufferRef.current = buffer;
         // 复用同一份解码 PCM 做静音与音量质检（不重新解码）
         setRmsWindows(computeRmsWindows(buffer));
@@ -359,7 +396,7 @@ export default function App() {
         setLoadPhase('idle');
       }
     },
-    [engine, resetChapters, runPeaks],
+    [engine, resetChapters, runPeaks, repeatClient],
   );
 
   /** 峰值计算失败后的恢复入口：复用保留的 AudioBuffer，不再重新解码。 */
@@ -607,6 +644,47 @@ export default function App() {
       previewRef.current = null;
       engine.play(t);
       setPlayhead(t);
+      setPlaying(true);
+    },
+    [engine, stopAudition],
+  );
+
+  // ---- 重复录制定位 ----
+  /**
+   * 以当前选中章节为样本搜索整段录音。计算在 Worker 中进行；token 单调
+   * 递增，连续搜索 / 样本变化时旧结果在每个 await 后被静默丢弃，只有
+   * 最新一次搜索能写入命中列表。
+   */
+  const runRepeatSearch = useCallback(async () => {
+    const buffer = currentBufferRef.current;
+    const sample = selected;
+    if (!buffer || !sample) return;
+    const token = ++repeatTokenRef.current;
+    setRepeatSearching(true);
+    setRepeatError(null);
+    setRepeatHits(null);
+    try {
+      const hits = await repeatClient.search(buffer, { start: sample.start, end: sample.end });
+      if (token !== repeatTokenRef.current) return; // 已有更新的搜索或样本已变
+      setRepeatHits(hits);
+      setRepeatSearching(false);
+    } catch (err) {
+      if (err instanceof RepeatSearchSupersededError) return;
+      if (token !== repeatTokenRef.current) return;
+      setRepeatHits(null);
+      setRepeatSearching(false);
+      setRepeatError(err instanceof Error ? err.message : '重复录制搜索失败。');
+    }
+  }, [repeatClient, selected]);
+
+  /** 试听命中片段：播放该命中区间（到点自动停止）。 */
+  const previewRepeatHit = useCallback(
+    (hit: RepeatHit) => {
+      if (!engine.hasBuffer) return;
+      stopAudition();
+      previewRef.current = null;
+      engine.play(hit.start, hit.end);
+      setPlayhead(hit.start);
       setPlaying(true);
     },
     [engine, stopAudition],
@@ -1073,6 +1151,14 @@ export default function App() {
                 onProcess={processMuting}
                 onToggleAudition={toggleAudition}
                 onDownload={downloadMutedWav}
+              />
+              <RepeatSearchPanel
+                sample={selected}
+                hits={repeatHits}
+                searching={repeatSearching}
+                error={repeatError}
+                onSearch={runRepeatSearch}
+                onPreview={previewRepeatHit}
               />
               {selected ? (
                 <>
